@@ -133,27 +133,23 @@ Output:
 
 ---
 
-## Exercises for Students
+## Some sample things to try, and start the experimenting with!
 
-1. **Medoid start node**: Replace the random start node with the *medoid* — the point closest to the centroid of the dataset. How does this affect search recall?
+0. **Code understanding**: Use AI tools to understand the logic of algorithm and how it is a hueristic approximation of what we discussed in class
 
-2. **Different distance metrics**: Add inner product or cosine distance in `distance.h/cpp`. How does the alpha-RNG rule behave differently?
+1. **Beam width experiments**: Try different `L` values during build and measure recall vs build time. What's the sweet spot?
 
-3. **Beam width experiments**: Try different `L` values during build and measure recall vs build time. What's the sweet spot?
+2. **Medoid start node**: Replace the random start node with the *medoid* — the point closest to the centroid of the dataset. How does this affect search recall?
 
-4. **Graph visualization**: Dump the graph in DOT format for a small dataset (e.g., 100 points in 2D) and visualize with Graphviz. What does the structure look like?
+3. **Change the edges in index build**: Run the build twice — second pass starts from the graph produced by the first. How does recall change?
 
-5. **CSR graph format**: Replace `vector<vector<uint32_t>>` with a compressed sparse row (CSR) format for the search-time graph. Measure the impact on search latency.
+4. **Change the search algorithm**: Plot the histogram of node degrees. Is it uniform? What happens with different `α` values?
 
-6. **Two-pass build**: Run the build twice — second pass starts from the graph produced by the first. How does recall change?
-
-7. **Degree distribution**: Plot the histogram of node degrees. Is it uniform? What happens with different `α` values?
-
-8. **Concurrent search optimization**: Replace `std::vector<bool> visited` in `greedy_search()` with a pre-allocated scratch buffer to avoid per-query allocation.
+5. **Concurrent search optimization**: Replace `std::vector<bool> visited` in `greedy_search()` with a pre-allocated scratch buffer to avoid per-query allocation.
 
 ---
 
 ## References
 
 - Subramanya et al., *DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node*, NeurIPS 2019
-- Jayaram Subramanya et al., *RNG: Relative Neighborhood Graph for Approximate Nearest Neighbor Search*
+
