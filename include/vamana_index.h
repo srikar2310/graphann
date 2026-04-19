@@ -89,4 +89,5 @@ class VamanaIndex {
     const float* get_vector(uint32_t id) const {
         return data_ + (size_t)id * dim_;
     }
+    void VamanaIndex::run_build_pass(uint32_t R, uint32_t L, float alpha, float gamma, std::mt19937& rng);
 };
