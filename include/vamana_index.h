@@ -66,6 +66,12 @@ class VamanaIndex {
     std::pair<std::vector<Candidate>, uint32_t>
     greedy_search(const float* query, uint32_t L) const;
 
+    std::vector<float> densities_; // Stores ρ(p) for each point
+    float max_rho_ = 0.0f;         // Stores max(ρ)
+    
+    // Helper to calculate ρ(p)
+    float compute_rho(uint32_t point_id, uint32_t k = 5);
+
     // Alpha-RNG pruning: selects a diverse subset of candidates as neighbors.
     // Modifies graph_[node] in place. Candidates should NOT include node itself.
     void robust_prune(uint32_t node, std::vector<Candidate>& candidates,
@@ -89,5 +95,4 @@ class VamanaIndex {
     const float* get_vector(uint32_t id) const {
         return data_ + (size_t)id * dim_;
     }
-    void VamanaIndex::run_build_pass(uint32_t R, uint32_t L, float alpha, float gamma, std::mt19937& rng);
 };

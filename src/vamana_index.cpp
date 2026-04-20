@@ -2,7 +2,7 @@
 #include "distance.h"
 #include "io_utils.h"
 #include "timer.h"
-#include <omp.h>
+
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -116,39 +116,49 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
 // (alpha > 1 makes it easier for a candidate to survive pruning).
 
 void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
-                               float alpha, uint32_t R) {
-    // Remove self from candidates if present
-    candidates.erase(
-        std::remove_if(candidates.begin(), candidates.end(),
-                       [node](const Candidate& c) { return c.second == node; }),
-        candidates.end());
-
-    // Sort by distance to node (ascending)
+                               float alpha_base, uint32_t R) {
+    // 1. Remove self and sort
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                     [node](const Candidate& c){ return c.second == node; }), 
+                     candidates.end());
     std::sort(candidates.begin(), candidates.end());
 
-    std::vector<uint32_t> new_neighbors;
-    new_neighbors.reserve(R);
+    // 2. Calculate Adaptive Alpha for this specific point
+    // Formula: αp = 1.0 + β * (ρ(p) / max_ρ)
+    // Here we use alpha_base as our "1.0 + β" target
+    float beta = alpha_base - 1.0f;
+    float local_alpha = 1.0f + beta * (densities_[node] / (max_rho_ + 1e-9f));
 
-    for (const auto& [dist_to_node, cand_id] : candidates) {
-        if (new_neighbors.size() >= R)
-            break;
+    std::vector<uint32_t> new_nbrs;
+    new_nbrs.reserve(R);
 
-        // Check alpha-RNG condition against all already-selected neighbors
+    for (const auto& [dn, cid] : candidates) {
+        if (new_nbrs.size() >= R) break;
         bool keep = true;
-        for (uint32_t selected : new_neighbors) {
-            float dist_cand_to_selected =
-                compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
-            if (dist_to_node > alpha * dist_cand_to_selected) {
-                keep = false;
-                break;
+        for (uint32_t sel : new_nbrs) {
+            float dc = compute_l2sq(get_vector(cid), get_vector(sel), dim_);
+            if (dn > local_alpha * dc) { 
+                keep = false; 
+                break; 
             }
         }
-
-        if (keep)
-            new_neighbors.push_back(cand_id);
+        if (keep) new_nbrs.push_back(cid);
     }
+    graph_[node] = std::move(new_nbrs);
+}
 
-    graph_[node] = std::move(new_neighbors);
+// Helper function
+
+float VamanaIndex::compute_rho(uint32_t point_id, uint32_t k) {
+    // Initial rho estimate: distance to k-th neighbor in a random start search
+    // Since the graph is empty/sparse at start, this is a rough approximation
+    auto [candidates, _] = greedy_search(get_vector(point_id), k);
+    if (candidates.empty()) return 1.0f; 
+    
+    // Mean distance to top k neighbors
+    float sum_dist = 0.0f;
+    for (const auto& c : candidates) sum_dist += std::sqrt(c.first);
+    return sum_dist / candidates.size();
 }
 
 // ============================================================================
@@ -260,75 +270,66 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     data_ = mat.data.release();
     owns_data_ = true;
 
-    if (L < R) {
-        std::cerr << "Warning: L < R. Setting L = R." << std::endl;
-        L = R;
-    }
-
-    // --- Initialize graph and locks ---
+    // --- Initialization ---
     graph_.assign(npts_, std::vector<uint32_t>());
     locks_ = std::vector<std::mutex>(npts_);
+    densities_.assign(npts_, 0.0f);
+    max_rho_ = 0.0f;
 
-    // --- Pick start node ---
-    std::mt19937 rng(42);
-    start_node_ = rng() % npts_;
-
-    Timer build_timer;
-
-    // --- Pass 1: Local Connectivity (alpha = 1.0) ---
-    // This creates the base structure of the graph.
-    std::cout << "Starting Pass 1 (alpha = 1.0)..." << std::endl;
-    run_build_pass(R, L, 1.0f, gamma, rng);
-
-    // --- Pass 2: Long-range Navigability (user-defined alpha) ---
-    // This adds the "shortcut" edges that make the graph navigable.
-    std::cout << "\nStarting Pass 2 (alpha = " << alpha << ")..." << std::endl;
-    run_build_pass(R, L, alpha, gamma, rng);
-
-    double build_time = build_timer.elapsed_seconds();
-    std::cout << "\nBuild complete in " << build_time << " seconds." << std::endl;
-}
-
-void VamanaIndex::run_build_pass(uint32_t R, uint32_t L, float alpha, float gamma, std::mt19937& rng) {
-    uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
-    
-    // Create random insertion order for this pass
     std::vector<uint32_t> perm(npts_);
     std::iota(perm.begin(), perm.end(), 0);
+    std::mt19937 rng(42);
     std::shuffle(perm.begin(), perm.end(), rng);
+    start_node_ = perm[0]; // Ensure a valid start node for density estimation
+
+    // --- Step 1: Pre-calculate Densities ρ(p) ---
+    // We must actually calculate the density to avoid Division by Zero
+    std::cout << "Estimating local densities..." << std::endl;
+    #pragma omp parallel for reduction(max:max_rho_)
+    for (uint32_t i = 0; i < npts_; i++) {
+        // compute_rho performs a small search to find the local neighborhood radius
+        float rho = compute_rho(i, 5); 
+        densities_[i] = rho;
+        if (rho > max_rho_) max_rho_ = rho;
+    }
+    
+    // Ensure max_rho_ is not 0 to prevent div-by-zero
+    if (max_rho_ == 0) max_rho_ = 1.0f;
+
+    // --- Step 2: Main Build Loop ---
+    uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
+    Timer build_timer;
 
     #pragma omp parallel for schedule(dynamic, 64)
     for (size_t idx = 0; idx < npts_; idx++) {
         uint32_t point = perm[idx];
 
-        // Step 1: Search current graph
+        // 1. Search
         auto [candidates, _] = greedy_search(get_vector(point), L);
 
-        // Step 2: Robust Prune
-        // Note: We don't clear graph_[point] here; Vamana's second pass
-        // refines the existing edges.
+        // 2. Adaptive Pruning (Uses the densities_ we just calculated)
         robust_prune(point, candidates, alpha, R);
 
-        // Step 3 & 4: Backward edges and Re-pruning
+        // 3. Backward Edges
         for (uint32_t nbr : graph_[point]) {
             std::lock_guard<std::mutex> lock(locks_[nbr]);
             graph_[nbr].push_back(point);
 
             if (graph_[nbr].size() > gamma_R) {
-                std::vector<Candidate> nbr_candidates;
-                nbr_candidates.reserve(graph_[nbr].size());
+                std::vector<Candidate> nbr_cands;
                 for (uint32_t nn : graph_[nbr]) {
-                    float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
-                    nbr_candidates.push_back({d, nn});
+                    nbr_cands.push_back({compute_l2sq(get_vector(nbr), get_vector(nn), dim_), nn});
                 }
-                robust_prune(nbr, nbr_candidates, alpha, R);
+                robust_prune(nbr, nbr_cands, alpha, R);
             }
         }
 
-        if (idx % 10000 == 0 && omp_get_thread_num() == 0) {
-            std::cout << "\r  Progress: " << idx << " / " << npts_ << std::flush;
+        if (idx % 50000 == 0) {
+            #pragma omp critical
+            std::cout << "\r  Inserted " << idx << " / " << npts_ << " points" << std::flush;
         }
     }
+    std::cout << "\nBuild complete in " << build_timer.elapsed_seconds() << " seconds." << std::endl;
 }
 
 // ============================================================================
