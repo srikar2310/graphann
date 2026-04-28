@@ -4,13 +4,14 @@
 #include "timer.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <numeric>
 #include <random>
 #include <set>
 #include <stdexcept>
-#include <cstdlib>
 
 // ============================================================================
 // Destructor
@@ -26,65 +27,55 @@ VamanaIndex::~VamanaIndex() {
 // ============================================================================
 // Greedy Search
 // ============================================================================
-// Beam search starting from start_node_. Maintains a candidate set of at most
-// L nodes, always expanding the closest unvisited node. Returns when no
-// unvisited candidates remain.
+// Beam search from a caller-supplied entry node.  Maintains a candidate set
+// of at most L nodes ordered by distance, always expanding the closest
+// unvisited node until no unexpanded candidates remain.
 //
-// Uses std::set<Candidate> as an ordered container — simple, correct, and
-// easy for students to understand and modify.
+// The entry point is now a parameter so that PC Teleport can supply a
+// query-specific starting node instead of the fixed start_node_.
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
-VamanaIndex::greedy_search(const float* query, uint32_t L) const {
-    // Candidate set: ordered by (distance, id). Bounded at size L.
+VamanaIndex::greedy_search(const float* query, uint32_t L,
+                           uint32_t entry) const {
     std::set<Candidate> candidate_set;
-    // Track which nodes we've already expanded (visited).
-    std::vector<bool> visited(npts_, false);
-
+    std::vector<bool>   visited(npts_, false);
+    std::set<uint32_t>  expanded;
     uint32_t dist_cmps = 0;
 
-    // Seed with start node
-    float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
+    // Seed with the supplied entry point.
+    float start_dist = compute_l2sq(query, get_vector(entry), dim_);
     dist_cmps++;
-    candidate_set.insert({start_dist, start_node_});
-    visited[start_node_] = true;
-
-    // Track which candidates have been expanded (their neighbors explored).
-    // We iterate through candidate_set; entries before our "frontier" pointer
-    // have been expanded. We use a simple approach: keep scanning from the
-    // beginning of the set for the first un-expanded entry.
-    std::set<uint32_t> expanded;
+    candidate_set.insert({start_dist, entry});
+    visited[entry] = true;
 
     while (true) {
-        // Find closest candidate that hasn't been expanded yet
+        // Find the closest candidate that has not been expanded yet.
         uint32_t best_node = UINT32_MAX;
         for (const auto& [dist, id] : candidate_set) {
-            if (expanded.find(id) == expanded.end()) {
+            if (!expanded.count(id)) {
                 best_node = id;
                 break;
             }
         }
         if (best_node == UINT32_MAX)
-            break;  // all candidates expanded
+            break;
 
         expanded.insert(best_node);
 
-        // Expand: evaluate all neighbors of best_node
-        // Copy neighbor list under lock to avoid data race with parallel build
-        // (another thread might push_back / reallocate graph_[best_node]).
+        // Copy neighbor list under lock to avoid data races with parallel build.
         std::vector<uint32_t> neighbors;
         {
             std::lock_guard<std::mutex> lock(locks_[best_node]);
             neighbors = graph_[best_node];
         }
+
         for (uint32_t nbr : neighbors) {
-            if (visited[nbr])
-                continue;
+            if (visited[nbr]) continue;
             visited[nbr] = true;
 
             float d = compute_l2sq(query, get_vector(nbr), dim_);
             dist_cmps++;
 
-            // Insert if candidate set isn't full or this is closer than worst
             if (candidate_set.size() < L) {
                 candidate_set.insert({d, nbr});
             } else {
@@ -97,260 +88,363 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
         }
     }
 
-    // Convert to sorted vector
     std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
     return {results, dist_cmps};
 }
 
 // ============================================================================
-// Robust Prune (Alpha-RNG Rule)
+// Robust Prune  —  Standard Alpha-RNG
 // ============================================================================
-// Given a node and a set of candidates, greedily select neighbors that are
-// "diverse" — a candidate c is added only if it's not too close to any
-// already-selected neighbor (within a factor of alpha).
-//
-// Formally: add c if for ALL already-chosen neighbors n:
-//     dist(node, c) <= alpha * dist(c, n)
-//
-// This ensures good graph navigability by keeping some long-range edges
-// (alpha > 1 makes it easier for a candidate to survive pruning).
+// Prunes candidates to at most R diverse neighbors using the alpha-RNG rule.
+// A candidate c is kept only if dist(node, c) <= alpha * dist(c, n) for all
+// already-selected neighbors n.  The supplied alpha is used as-is for every
+// node (no per-node adaptation).
 
-void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
-                               float alpha_base, uint32_t R) {
-    // 1. Remove self and sort
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                     [node](const Candidate& c){ return c.second == node; }), 
-                     candidates.end());
+void VamanaIndex::robust_prune(uint32_t node,
+                               std::vector<Candidate>& candidates,
+                               float alpha, uint32_t R) {
+    // Remove self from candidates.
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(),
+                       [node](const Candidate& c) { return c.second == node; }),
+        candidates.end());
+
+    // Sort by ascending distance to node.
     std::sort(candidates.begin(), candidates.end());
 
-    // 2. Calculate Adaptive Alpha for this specific point
-    // Formula: αp = 1.0 + β * (ρ(p) / max_ρ)
-    // Here we use alpha_base as our "1.0 + β" target
-    float beta = alpha_base - 1.0f;
-    float local_alpha = 1.0f + beta * (densities_[node] / (max_rho_ + 1e-9f));
+    std::vector<uint32_t> new_neighbors;
+    new_neighbors.reserve(R);
 
-    std::vector<uint32_t> new_nbrs;
-    new_nbrs.reserve(R);
+    for (const auto& [dist_to_node, cand_id] : candidates) {
+        if (new_neighbors.size() >= R) break;
 
-    for (const auto& [dn, cid] : candidates) {
-        if (new_nbrs.size() >= R) break;
+        // Keep this candidate iff it is not "occluded" by any already-chosen
+        // neighbor: occluded means  dist(node, cand) > alpha * dist(cand, n).
         bool keep = true;
-        for (uint32_t sel : new_nbrs) {
-            float dc = compute_l2sq(get_vector(cid), get_vector(sel), dim_);
-            if (dn > local_alpha * dc) { 
-                keep = false; 
-                break; 
+        for (uint32_t selected : new_neighbors) {
+            float dist_cand_to_selected =
+                compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
+            if (dist_to_node > alpha * dist_cand_to_selected) {
+                keep = false;
+                break;
             }
         }
-        if (keep) new_nbrs.push_back(cid);
+        if (keep)
+            new_neighbors.push_back(cand_id);
     }
-    graph_[node] = std::move(new_nbrs);
-}
 
-// Helper function
-
-float VamanaIndex::compute_rho(uint32_t point_id, uint32_t k) {
-    // Initial rho estimate: distance to k-th neighbor in a random start search
-    // Since the graph is empty/sparse at start, this is a rough approximation
-    auto [candidates, _] = greedy_search(get_vector(point_id), k);
-    if (candidates.empty()) return 1.0f; 
-    
-    // Mean distance to top k neighbors
-    float sum_dist = 0.0f;
-    for (const auto& c : candidates) sum_dist += std::sqrt(c.first);
-    return sum_dist / candidates.size();
+    graph_[node] = std::move(new_neighbors);
 }
 
 // ============================================================================
-// Build
+// PC Teleport — compute_pca
 // ============================================================================
+// Computes the dataset centroid and the first principal component (PC1) via
+// power iteration, then pre-computes every point's scalar projection onto
+// PC1 and sorts the list.  Total cost: O(iters * npts * dim).
+//
+// At query time, get_entry_point() binary-searches this sorted list in
+// O(log npts) to find the dataset point whose PC1 projection is nearest to
+// the query's.  That point becomes the greedy-search entry — much better
+// initialisation than a random node, with essentially zero per-query overhead.
 
-// void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
-//                         float alpha, float gamma) {
-//     // --- Load data ---
-//     std::cout << "Loading data from " << data_path << "..." << std::endl;
-//     FloatMatrix mat = load_fbin(data_path);
-//     npts_ = mat.npts;
-//     dim_  = mat.dims;
-//     data_ = mat.data.release();
-//     owns_data_ = true;
+void VamanaIndex::compute_pca(int iters) {
+    // ---- Centroid ----
+    mean_vec_.assign(dim_, 0.0f);
+    for (uint32_t i = 0; i < npts_; ++i) {
+        const float* v = row(i);
+        for (uint32_t d = 0; d < dim_; ++d)
+            mean_vec_[d] += v[d];
+    }
+    for (float& val : mean_vec_) val /= static_cast<float>(npts_);
 
-//     std::cout << "  Points: " << npts_ << ", Dimensions: " << dim_ << std::endl;
+    // ---- Power iteration for PC1 ----
+    // Start from a constant vector; it converges in ~10-20 steps for typical
+    // ANN datasets.
+    pc_vec_.assign(dim_, 1.0f / std::sqrt(static_cast<float>(dim_)));
 
-//     if (L < R) {
-//         std::cerr << "Warning: L (" << L << ") < R (" << R
-//                   << "). Setting L = R." << std::endl;
-//         L = R;
-//     }
+    std::vector<float> next_pc(dim_);
+    for (int iter = 0; iter < iters; ++iter) {
+        std::fill(next_pc.begin(), next_pc.end(), 0.0f);
 
-//     // --- Initialize empty graph and per-node locks ---
-//     graph_.resize(npts_);
-//     locks_ = std::vector<std::mutex>(npts_);
+        // next_pc = (X - mean)^T (X - mean) pc_vec  — one step of power method.
+        for (uint32_t i = 0; i < npts_; ++i) {
+            const float* v = row(i);
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < dim_; ++d)
+                dot += (v[d] - mean_vec_[d]) * pc_vec_[d];
+            for (uint32_t d = 0; d < dim_; ++d)
+                next_pc[d] += dot * (v[d] - mean_vec_[d]);
+        }
 
-//     // --- Pick random start node ---
-//     std::mt19937 rng(42);  // fixed seed for reproducibility
-//     start_node_ = rng() % npts_;
-//     std::cout << "  Start node: " << start_node_ << std::endl;
+        // Normalize.
+        float norm = 0.0f;
+        for (float val : next_pc) norm += val * val;
+        norm = std::sqrt(norm);
+        if (norm < 1e-12f) break;  // degenerate dataset — stop early
+        for (uint32_t d = 0; d < dim_; ++d)
+            pc_vec_[d] = next_pc[d] / norm;
+    }
 
-//     // --- Create random insertion order ---
-//     std::vector<uint32_t> perm(npts_);
-//     std::iota(perm.begin(), perm.end(), 0);
-//     std::shuffle(perm.begin(), perm.end(), rng);
+    // ---- Pre-compute sorted projections ----
+    projections_.resize(npts_);
+    for (uint32_t i = 0; i < npts_; ++i) {
+        const float* v = row(i);
+        float proj = 0.0f;
+        for (uint32_t d = 0; d < dim_; ++d)
+            proj += (v[d] - mean_vec_[d]) * pc_vec_[d];
+        projections_[i] = {proj, i};
+    }
+    std::sort(projections_.begin(), projections_.end());
+}
 
-//     // --- Build graph: parallel insertion with per-node locking ---
-//     uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
-//     std::cout << "Building index (R=" << R << ", L=" << L
-//               << ", alpha=" << alpha << ", gamma=" << gamma
-//               << ", gammaR=" << gamma_R << ")..." << std::endl;
+// ============================================================================
+// PC Teleport — get_entry_point
+// ============================================================================
+// Projects the query onto PC1 then binary-searches the sorted projections
+// array for the nearest value.  Returns the corresponding point id.
 
-//     Timer build_timer;
+uint32_t VamanaIndex::get_entry_point(const float* query) const {
+    float q_proj = 0.0f;
+    for (uint32_t d = 0; d < dim_; ++d)
+        q_proj += (query[d] - mean_vec_[d]) * pc_vec_[d];
 
-//     #pragma omp parallel for schedule(dynamic, 64)
-//     for (size_t idx = 0; idx < npts_; idx++) {
-//         uint32_t point = perm[idx];
+    // Find the first projection >= q_proj.
+    auto it = std::lower_bound(
+        projections_.begin(), projections_.end(),
+        std::make_pair(q_proj, 0u));
 
-//         // Step 1: Search for this point in the current graph to find candidates
-//         auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
+    if (it == projections_.end())
+        return projections_.back().second;
 
-//         // Step 2: Prune candidates to get this point's neighbors
-//         // We don't need to lock graph_[point] here because each point appears
-//         // exactly once in the permutation — only this thread writes to it now.
-//         robust_prune(point, candidates, alpha, R);
+    if (it == projections_.begin())
+        return it->second;
 
-//         // Step 3: Add backward edges from each new neighbor back to this point
-//         for (uint32_t nbr : graph_[point]) {
-//             std::lock_guard<std::mutex> lock(locks_[nbr]);
+    // Compare the two surrounding entries and pick the closer one.
+    auto prev_it = std::prev(it);
+    if (std::abs(prev_it->first - q_proj) < std::abs(it->first - q_proj))
+        return prev_it->second;
 
-//             // Add backward edge
-//             graph_[nbr].push_back(point);
+    return it->second;
+}
 
-//             // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
-//             if (graph_[nbr].size() > gamma_R) {
-//                 // Build candidate list from current neighbors of nbr
-//                 std::vector<Candidate> nbr_candidates;
-//                 nbr_candidates.reserve(graph_[nbr].size());
-//                 for (uint32_t nn : graph_[nbr]) {
-//                     float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
-//                     nbr_candidates.push_back({d, nn});
-//                 }
-//                 robust_prune(nbr, nbr_candidates, alpha, R);
-//             }
-//         }
+// ============================================================================
+// Build Pass  —  internal helper
+// ============================================================================
+// A single insertion pass over the permutation `perm`.
+// If clear_graph is true, all adjacency lists are zeroed before the pass
+// (used for pass 1).  Pass 2 starts from the graph left by pass 1.
 
-//         // Progress reporting (from one thread only)
-//         if (idx % 10000 == 0) {
-//             #pragma omp critical
-//             {
-//                 std::cout << "\r  Inserted " << idx << " / " << npts_
-//                           << " points" << std::flush;
-//             }
-//         }
-//     }
+void VamanaIndex::build_pass(const std::vector<uint32_t>& perm,
+                             uint32_t R, uint32_t L,
+                             float pass_alpha, float gamma,
+                             bool clear_graph) {
+    if (clear_graph) {
+        for (auto& adj : graph_) adj.clear();
+    }
 
-//     double build_time = build_timer.elapsed_seconds();
+    const uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
 
-//     // Compute average degree
-//     size_t total_edges = 0;
-//     for (uint32_t i = 0; i < npts_; i++)
-//         total_edges += graph_[i].size();
-//     double avg_degree = (double)total_edges / npts_;
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (size_t idx = 0; idx < npts_; idx++) {
+        uint32_t point = perm[idx];
 
-//     std::cout << "\n  Build complete in " << build_time << " seconds."
-//               << std::endl;
-//     std::cout << "  Average out-degree: " << avg_degree << std::endl;
-// }
+        // Step 1 (pass 2 only): snapshot pass-1 neighbors BEFORE searching.
+        //
+        // We read graph_[point] now, under its lock, before greedy_search
+        // runs.  This is safe because no other thread writes graph_[point]'s
+        // forward edges — only backward-edge insertion (step 4 below) touches
+        // it under the lock, and we haven't started that yet for this point.
+        // Reading here avoids any race with the write in robust_prune (step 3)
+        // which runs unlocked because this thread is the sole forward-edge
+        // owner of `point` in the permutation.
+        std::vector<uint32_t> pass1_nbrs;
+        if (!clear_graph) {
+            std::lock_guard<std::mutex> lk(locks_[point]);
+            pass1_nbrs = graph_[point];
+        }
 
-void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
+        // Step 2: Greedy search to collect candidates.
+        //
+        // Always use start_node_ as the build-time entry for both passes.
+        // PC Teleport is a query-time optimisation only — using it during
+        // build concentrates traffic on PC1-median nodes, over-prunes their
+        // neighborhoods, and hurts recall.
+        auto [candidates, _dist_cmps] =
+            greedy_search(get_vector(point), L, start_node_);
+
+        // Step 3 (pass 2 only): merge pass-1 neighbors into candidates.
+        //
+        // robust_prune overwrites graph_[point] from scratch using only what
+        // greedy_search found.  If L is too small, close pass-1 neighbors
+        // not rediscovered by the search are permanently lost.  Merging them
+        // in ensures pass 2 refines the graph rather than replacing it.
+        // pass1_nbrs was captured before the search so there is no race.
+        for (uint32_t existing_nbr : pass1_nbrs) {
+            float d = compute_l2sq(row(point), row(existing_nbr), dim_);
+            candidates.push_back({d, existing_nbr});
+        }
+
+        // Step 4: Prune candidates → write this node's forward edges.
+        // No lock needed: each point appears exactly once in perm so only
+        // this thread writes graph_[point]'s forward list.
+        robust_prune(point, candidates, pass_alpha, R);
+
+        // graph_[point] is now stable for this thread — read it directly.
+        // (No other thread writes forward edges for `point`; backward-edge
+        // writers hold locks_[point] but only append/prune, and we finished
+        // our forward write above.)
+        const std::vector<uint32_t> fwd_nbrs = graph_[point];
+
+        // Step 4: Add backward edges from each forward neighbor back to point.
+        for (uint32_t nbr : fwd_nbrs) {
+            std::lock_guard<std::mutex> lock(locks_[nbr]);
+
+            // Avoid duplicate backward edges in pass 2.
+            bool already_present = false;
+            for (uint32_t existing : graph_[nbr]) {
+                if (existing == point) { already_present = true; break; }
+            }
+            if (!already_present)
+                graph_[nbr].push_back(point);
+
+            // Step 5: If nbr's degree exceeds gamma*R, prune it.
+            if (graph_[nbr].size() > gamma_R) {
+                std::vector<Candidate> nbr_cands;
+                nbr_cands.reserve(graph_[nbr].size());
+                for (uint32_t nn : graph_[nbr]) {
+                    float d = compute_l2sq(row(nbr), row(nn), dim_);
+                    nbr_cands.push_back({d, nn});
+                }
+                robust_prune(nbr, nbr_cands, pass_alpha, R);
+            }
+        }
+
+        if (idx % 10000 == 0) {
+            #pragma omp critical
+            std::cout << "\r  Inserted " << idx << " / " << npts_
+                      << " points" << std::flush;
+        }
+    }
+    std::cout << "\r  Inserted " << npts_ << " / " << npts_
+              << " points" << std::endl;
+}
+
+// ============================================================================
+// Build  —  Two-Pass Construction
+// ============================================================================
+// Overview of the two enhancements and how they interleave:
+//
+//  [PRE-PASS]
+//    • compute_pca()  — establishes PC1 projections for PC Teleport.
+//
+//  [PASS 1]   pass_alpha = 1.0
+//    • Local, short-range graph built quickly.
+//
+//  [PASS 2]   pass_alpha = user alpha (>= 1.0)
+//    • Refines the graph starting from pass-1 edges.
+//    • robust_prune uses the fixed user alpha uniformly across all nodes.
+
+void VamanaIndex::build(const std::string& data_path,
+                        uint32_t R, uint32_t L,
                         float alpha, float gamma) {
-    // --- Load data ---
+    // ---- Load data ----
     std::cout << "Loading data from " << data_path << "..." << std::endl;
     FloatMatrix mat = load_fbin(data_path);
     npts_ = mat.npts;
     dim_  = mat.dims;
     data_ = mat.data.release();
     owns_data_ = true;
+    std::cout << "  Points: " << npts_ << ", Dimensions: " << dim_ << std::endl;
 
-    // --- Initialization ---
-    graph_.assign(npts_, std::vector<uint32_t>());
+    if (L < R) {
+        std::cerr << "Warning: L (" << L << ") < R (" << R
+                  << "). Setting L = R." << std::endl;
+        L = R;
+    }
+
+    // ---- Initialise graph and locks ----
+    graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
-    densities_.assign(npts_, 0.0f);
-    max_rho_ = 0.0f;
 
+    // ---- Fixed start node (fallback entry before PC Teleport is ready) ----
+    std::mt19937 rng(42);
+    start_node_ = rng() % npts_;
+    std::cout << "  Fallback start node: " << start_node_ << std::endl;
+
+    // ---- Random insertion order (same permutation for both passes) ----
     std::vector<uint32_t> perm(npts_);
     std::iota(perm.begin(), perm.end(), 0);
-    std::mt19937 rng(42);
     std::shuffle(perm.begin(), perm.end(), rng);
-    start_node_ = perm[0]; // Ensure a valid start node for density estimation
 
-    // --- Step 1: Pre-calculate Densities ρ(p) ---
-    // We must actually calculate the density to avoid Division by Zero
-    std::cout << "Estimating local densities..." << std::endl;
-    #pragma omp parallel for reduction(max:max_rho_)
-    for (uint32_t i = 0; i < npts_; i++) {
-        // compute_rho performs a small search to find the local neighborhood radius
-        float rho = compute_rho(i, 5); 
-        densities_[i] = rho;
-        if (rho > max_rho_) max_rho_ = rho;
-    }
-    
-    // Ensure max_rho_ is not 0 to prevent div-by-zero
-    if (max_rho_ == 0) max_rho_ = 1.0f;
+    // ================================================================
+    // PRE-PASS: PC Teleport initialisation
+    // ================================================================
+    std::cout << "\n[PC Teleport] Computing first principal component..." << std::endl;
+    Timer pca_timer;
+    compute_pca(/*iters=*/20);
+    std::cout << "  PCA done in " << pca_timer.elapsed_seconds()
+              << " s.  Entry points are now query-adaptive." << std::endl;
 
-    // --- Step 2: Main Build Loop ---
-    uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
-    Timer build_timer;
+    // ================================================================
+    // PASS 1: alpha = 1.0  (local short-range graph)
+    // ================================================================
+    std::cout << "\n[Pass 1] Building local graph"
+              << " (R=" << R << ", L=" << L << ", alpha=1.0, gamma=" << gamma
+              << ")..." << std::endl;
 
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (size_t idx = 0; idx < npts_; idx++) {
-        uint32_t point = perm[idx];
+    Timer pass1_timer;
+    build_pass(perm, R, L, /*pass_alpha=*/1.0f, gamma, /*clear_graph=*/true);
+    std::cout << "  Pass 1 complete in " << pass1_timer.elapsed_seconds()
+              << " s." << std::endl;
 
-        // 1. Search
-        auto [candidates, _] = greedy_search(get_vector(point), L);
+    // ================================================================
+    // PASS 2: alpha = user value  (long-range edges)
+    // ================================================================
+    std::cout << "\n[Pass 2] Refining with long-range edges"
+              << " (R=" << R << ", L=" << L << ", alpha=" << alpha
+              << ", gamma=" << gamma << ")..." << std::endl;
 
-        // 2. Adaptive Pruning (Uses the densities_ we just calculated)
-        robust_prune(point, candidates, alpha, R);
+    Timer pass2_timer;
+    // clear_graph=false: pass 2 starts from the pass-1 graph.
+    build_pass(perm, R, L, alpha, gamma, /*clear_graph=*/false);
+    std::cout << "  Pass 2 complete in " << pass2_timer.elapsed_seconds()
+              << " s." << std::endl;
 
-        // 3. Backward Edges
-        for (uint32_t nbr : graph_[point]) {
-            std::lock_guard<std::mutex> lock(locks_[nbr]);
-            graph_[nbr].push_back(point);
+    // ---- Summary stats ----
+    size_t total_edges = 0;
+    for (uint32_t i = 0; i < npts_; ++i) total_edges += graph_[i].size();
+    double avg_degree = static_cast<double>(total_edges) / npts_;
 
-            if (graph_[nbr].size() > gamma_R) {
-                std::vector<Candidate> nbr_cands;
-                for (uint32_t nn : graph_[nbr]) {
-                    nbr_cands.push_back({compute_l2sq(get_vector(nbr), get_vector(nn), dim_), nn});
-                }
-                robust_prune(nbr, nbr_cands, alpha, R);
-            }
-        }
-
-        if (idx % 50000 == 0) {
-            #pragma omp critical
-            std::cout << "\r  Inserted " << idx << " / " << npts_ << " points" << std::flush;
-        }
-    }
-    std::cout << "\nBuild complete in " << build_timer.elapsed_seconds() << " seconds." << std::endl;
+    std::cout << "\n  Build complete." << std::endl;
+    std::cout << "  Average out-degree: " << avg_degree << std::endl;
 }
 
 // ============================================================================
-// Search
+// Search  —  with PC Teleport entry point
 // ============================================================================
 
-SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
+SearchResult VamanaIndex::search(const float* query, uint32_t K,
+                                 uint32_t L) const {
     if (L < K) L = K;
 
+    // Use PC Teleport if PCA has been computed, otherwise fall back to the
+    // fixed start node (e.g. after load() without recomputing PCA).
+    uint32_t entry = projections_.empty()
+                         ? start_node_
+                         : get_entry_point(query);
+
     Timer t;
-    auto [candidates, dist_cmps] = greedy_search(query, L);
+    auto [candidates, dist_cmps] = greedy_search(query, L, entry);
     double latency = t.elapsed_us();
 
-    // Return top-K results
     SearchResult result;
-    result.dist_cmps = dist_cmps;
+    result.dist_cmps  = dist_cmps;
     result.latency_us = latency;
     result.ids.reserve(K);
-    for (uint32_t i = 0; i < K && i < candidates.size(); i++) {
+    for (uint32_t i = 0; i < K && i < candidates.size(); ++i)
         result.ids.push_back(candidates[i].second);
-    }
+
     return result;
 }
 
@@ -358,28 +452,52 @@ SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) con
 // Save / Load
 // ============================================================================
 // Binary format:
-//   [uint32] npts
-//   [uint32] dim
-//   [uint32] start_node
-//   For each node i in [0, npts):
-//     [uint32] degree
-//     [uint32 * degree] neighbor IDs
+//
+//   Header (all uint32 unless noted):
+//     npts | dim | start_node
+//   Graph:
+//     For each node i:  degree  |  neighbor_ids[degree]
+//   PCA block (appended; load detects EOF gracefully if absent):
+//     [uint32] dim             — sanity check
+//     [float * dim] mean_vec
+//     [float * dim] pc_vec
+//     [uint32] npts            — number of projection entries
+//     [float * npts] proj_vals — projection scalars, sorted
+//     [uint32 * npts] proj_ids — corresponding point ids, sorted
 
 void VamanaIndex::save(const std::string& path) const {
     std::ofstream out(path, std::ios::binary);
     if (!out.is_open())
         throw std::runtime_error("Cannot open file for writing: " + path);
 
-    out.write(reinterpret_cast<const char*>(&npts_), 4);
-    out.write(reinterpret_cast<const char*>(&dim_), 4);
+    // Header
+    out.write(reinterpret_cast<const char*>(&npts_),       4);
+    out.write(reinterpret_cast<const char*>(&dim_),        4);
     out.write(reinterpret_cast<const char*>(&start_node_), 4);
 
-    for (uint32_t i = 0; i < npts_; i++) {
-        uint32_t deg = graph_[i].size();
+    // Graph
+    for (uint32_t i = 0; i < npts_; ++i) {
+        uint32_t deg = static_cast<uint32_t>(graph_[i].size());
         out.write(reinterpret_cast<const char*>(&deg), 4);
-        if (deg > 0) {
+        if (deg > 0)
             out.write(reinterpret_cast<const char*>(graph_[i].data()),
                       deg * sizeof(uint32_t));
+    }
+
+    // PCA block
+    if (!pc_vec_.empty()) {
+        uint32_t d = dim_;
+        out.write(reinterpret_cast<const char*>(&d), 4);
+        out.write(reinterpret_cast<const char*>(mean_vec_.data()),
+                  dim_ * sizeof(float));
+        out.write(reinterpret_cast<const char*>(pc_vec_.data()),
+                  dim_ * sizeof(float));
+
+        uint32_t n = static_cast<uint32_t>(projections_.size());
+        out.write(reinterpret_cast<const char*>(&n), 4);
+        for (const auto& [val, id] : projections_) {
+            out.write(reinterpret_cast<const char*>(&val), 4);
+            out.write(reinterpret_cast<const char*>(&id),  4);
         }
     }
 
@@ -390,20 +508,19 @@ void VamanaIndex::load(const std::string& index_path,
                        const std::string& data_path) {
     // Load data vectors
     FloatMatrix mat = load_fbin(data_path);
-    npts_ = mat.npts;
-    dim_  = mat.dims;
-    data_ = mat.data.release();
+    npts_      = mat.npts;
+    dim_       = mat.dims;
+    data_      = mat.data.release();
     owns_data_ = true;
 
-    // Load graph
     std::ifstream in(index_path, std::ios::binary);
     if (!in.is_open())
         throw std::runtime_error("Cannot open index file: " + index_path);
 
     uint32_t file_npts, file_dim;
-    in.read(reinterpret_cast<char*>(&file_npts), 4);
-    in.read(reinterpret_cast<char*>(&file_dim), 4);
-    in.read(reinterpret_cast<char*>(&start_node_), 4);
+    in.read(reinterpret_cast<char*>(&file_npts),    4);
+    in.read(reinterpret_cast<char*>(&file_dim),     4);
+    in.read(reinterpret_cast<char*>(&start_node_),  4);
 
     if (file_npts != npts_ || file_dim != dim_)
         throw std::runtime_error(
@@ -414,13 +531,35 @@ void VamanaIndex::load(const std::string& index_path,
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
 
-    for (uint32_t i = 0; i < npts_; i++) {
+    for (uint32_t i = 0; i < npts_; ++i) {
         uint32_t deg;
         in.read(reinterpret_cast<char*>(&deg), 4);
         graph_[i].resize(deg);
-        if (deg > 0) {
+        if (deg > 0)
             in.read(reinterpret_cast<char*>(graph_[i].data()),
                     deg * sizeof(uint32_t));
+    }
+
+    // Try to read optional PCA block
+    {
+        uint32_t d = 0;
+        in.read(reinterpret_cast<char*>(&d), 4);
+        if (in && d == dim_) {
+            mean_vec_.resize(dim_);
+            pc_vec_.resize(dim_);
+            in.read(reinterpret_cast<char*>(mean_vec_.data()),
+                    dim_ * sizeof(float));
+            in.read(reinterpret_cast<char*>(pc_vec_.data()),
+                    dim_ * sizeof(float));
+
+            uint32_t n = 0;
+            in.read(reinterpret_cast<char*>(&n), 4);
+            projections_.resize(n);
+            for (auto& [val, id] : projections_) {
+                in.read(reinterpret_cast<char*>(&val), 4);
+                in.read(reinterpret_cast<char*>(&id),  4);
+            }
+            std::cout << "  PC Teleport state loaded." << std::endl;
         }
     }
 
